@@ -1,0 +1,3 @@
+supabase
+reportlab
+pyinstaller

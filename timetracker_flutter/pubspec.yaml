@@ -1,0 +1,39 @@
+name: timetracker_flutter
+description: Freelance Time Tracker — Flutter mobile/desktop app backed by Supabase.
+version: 1.0.0+1
+
+environment:
+  sdk: ">=3.0.0 <4.0.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  # Supabase (same backend as the Python desktop app)
+  supabase_flutter: ^2.3.4
+
+  # Routing
+  go_router: ^13.0.0
+
+  # State management
+  flutter_riverpod: ^2.5.1
+
+  # Time formatting / utilities
+  intl: ^0.19.0
+  duration: ^4.0.1
+
+  # PDF export
+  pdf: ^3.10.8
+  printing: ^5.12.0
+
+  # Persistent local storage (offline-first)
+  sqflite: ^2.3.3
+  path: ^1.9.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^3.0.0
+
+flutter:
+  uses-material-design: true
