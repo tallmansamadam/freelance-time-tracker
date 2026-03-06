@@ -113,6 +113,7 @@ class TimeTrackerApp:
         self._update_clock()
         self._load_entries()
         self._sync_push_pending()   # background sweep on startup
+        self._startup_connect()     # test saved credentials, update sync dot
         self._start_animations()    # decorative canvas loop
 
     # ── Database ──────────────────────────────────────────────────────────────
@@ -1178,6 +1179,27 @@ class TimeTrackerApp:
                 threading.Thread(
                     target=self._sync_push_entry, args=(sync_id,), daemon=True
                 ).start()
+
+    def _startup_connect(self):
+        """If credentials are saved, test the connection in a background thread
+        and update the sync dot — no user action required."""
+        url = self._config.get("supabase_url", "").strip()
+        key = self._config.get("supabase_key", "").strip()
+        if not url or not key or not SUPABASE_AVAILABLE:
+            return
+        threading.Thread(target=self._bg_startup_connect, daemon=True).start()
+
+    def _bg_startup_connect(self):
+        """Background: ping Supabase and reflect result in the sync dot."""
+        client = self._get_supabase_client()
+        if client is None:
+            self.root.after(0, lambda: self._set_sync_status("error"))
+            return
+        try:
+            client.table("entries").select("id").limit(1).execute()
+            self.root.after(0, lambda: self._set_sync_status("synced"))
+        except Exception:
+            self.root.after(0, lambda: self._set_sync_status("error"))
 
     # ── PDF Export ────────────────────────────────────────────────────────────
 
