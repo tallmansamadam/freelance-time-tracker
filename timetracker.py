@@ -59,6 +59,7 @@ _APP_DIR    = (os.path.dirname(sys.executable) if getattr(sys, "frozen", False)
                else os.path.dirname(os.path.abspath(__file__)))
 DB_PATH     = os.path.join(_APP_DIR, "timetracker.db")
 CONFIG_PATH = os.path.join(_APP_DIR, "config.json")
+RESUME_PATH = os.path.join(_APP_DIR, "resume.json")
 
 # ── Color palette ─────────────────────────────────────────────────────────────
 PALETTE = [
@@ -91,10 +92,11 @@ class TimeTrackerApp:
         self.root.minsize(760, 580)
         self.root.configure(bg=BG)
 
-        self.running        = False
-        self.start_dt       = None
-        self.elapsed_secs   = 0
-        self._tick_job      = None
+        self.running          = False
+        self.start_dt         = None
+        self.elapsed_secs     = 0
+        self._elapsed_offset  = 0   # accumulated secs from previous sessions (resume)
+        self._tick_job        = None
         self.selected_color = PALETTE[0]
         self._color_btns    = []
 
@@ -161,7 +163,9 @@ class TimeTrackerApp:
                 )
 
     def _save_entry(self, end_dt: datetime):
-        h, rem = divmod(self.elapsed_secs, 3600)
+        # Use actual session duration (start_dt is reset to now on each start/resume)
+        actual_secs = int((end_dt - self.start_dt).total_seconds())
+        h, rem = divmod(actual_secs, 3600)
         m, s   = divmod(rem, 60)
         dur_str   = f"{h:02d}:{m:02d}:{s:02d}"
         date      = self.start_dt.strftime("%Y-%m-%d")
@@ -179,7 +183,7 @@ class TimeTrackerApp:
                       (date, start_time, end_time, duration_secs, duration_str,
                        label, tag_color, comment, sync_id, synced)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
-                """, (date, start_str, end_str, self.elapsed_secs, dur_str,
+                """, (date, start_str, end_str, actual_secs, dur_str,
                       label, tag_color, comment, sync_id))
         except sqlite3.Error as exc:
             messagebox.showerror("Database Error", f"Failed to save entry:\n{exc}", parent=self.root)
@@ -336,7 +340,7 @@ class TimeTrackerApp:
     # ── Config I/O ────────────────────────────────────────────────────────────
 
     def _load_config(self) -> dict:
-        defaults = {"supabase_url": "", "supabase_key": "", "resume": None}
+        defaults = {"supabase_url": "", "supabase_key": ""}
         if not os.path.exists(CONFIG_PATH):
             try:
                 with open(CONFIG_PATH, "w") as f:
@@ -483,7 +487,7 @@ class TimeTrackerApp:
         )
         self.stop_btn.pack(side="left", padx=10)
 
-        has_resume = bool(self._config.get("resume"))
+        has_resume = self._load_resume_state() is not None
         self.resume_btn = tk.Button(
             btn_row, text="⏎  RESUME LAST JOB",
             bg=BG3, fg="#00D4FF", activebackground=BG2, activeforeground="#00D4FF",
@@ -676,34 +680,50 @@ class TimeTrackerApp:
     # ── Timer logic ───────────────────────────────────────────────────────────
 
     def _save_resume_state(self):
-        """Persist current timer context so it can be resumed later."""
-        self._config["resume"] = {
+        """Persist current timer context to resume.json so it can be resumed later."""
+        state = {
             "elapsed_secs": self.elapsed_secs,
             "label":        self.label_var.get().strip(),
             "comment":      self.comment_var.get().strip(),
             "tag_color":    self.selected_color["hex"],
         }
-        self._save_config()
+        try:
+            with open(RESUME_PATH, "w") as f:
+                json.dump(state, f, indent=2)
+        except OSError:
+            pass
         if hasattr(self, "resume_btn"):
             self.resume_btn.config(state="normal")
 
     def _clear_resume_state(self):
-        self._config["resume"] = None
-        self._save_config()
+        try:
+            if os.path.exists(RESUME_PATH):
+                os.remove(RESUME_PATH)
+        except OSError:
+            pass
         if hasattr(self, "resume_btn"):
             self.resume_btn.config(state="disabled")
 
+    def _load_resume_state(self) -> dict | None:
+        if not os.path.exists(RESUME_PATH):
+            return None
+        try:
+            with open(RESUME_PATH) as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError):
+            return None
+
     def _resume(self):
         """Resume the last saved timer state."""
-        state = self._config.get("resume")
+        state = self._load_resume_state()
         if not state:
             return
         if self.running:
             return
 
-        elapsed = state.get("elapsed_secs", 0)
-        label   = state.get("label",   "")
-        comment = state.get("comment", "")
+        elapsed   = state.get("elapsed_secs", 0)
+        label     = state.get("label",     "")
+        comment   = state.get("comment",   "")
         color_hex = state.get("tag_color", PALETTE[0]["hex"])
 
         # Restore input fields
@@ -712,22 +732,25 @@ class TimeTrackerApp:
         color = next((c for c in PALETTE if c["hex"] == color_hex), PALETTE[0])
         self._select_color(color)
 
-        # Start timer at saved elapsed time
-        self.running      = True
-        self.elapsed_secs = elapsed
-        self.start_dt     = datetime.now() - timedelta(seconds=elapsed)
+        # Start timer continuing from saved elapsed, but start_dt is NOW so
+        # the new entry only records this session's actual work time.
+        self._elapsed_offset = elapsed
+        self.elapsed_secs    = elapsed
+        self.start_dt        = datetime.now()
+        self.running         = True
         self.start_btn.config(state="disabled")
         self.stop_btn.config(state="normal")
+        self._clear_resume_state()
         self._tick()
         self._pulse_running()
-        self._clear_resume_state()
 
     def _start(self):
         if self.running:
             return
-        self.running    = True
-        self.start_dt   = datetime.now()
-        self.elapsed_secs = 0
+        self._elapsed_offset = 0
+        self.running         = True
+        self.start_dt        = datetime.now()
+        self.elapsed_secs    = 0
         self.start_btn.config(state="disabled")
         self.stop_btn.config(state="normal")
         self._tick()
@@ -762,7 +785,8 @@ class TimeTrackerApp:
     def _tick(self):
         if not self.running:
             return
-        self.elapsed_secs = int((datetime.now() - self.start_dt).total_seconds())
+        session_secs      = int((datetime.now() - self.start_dt).total_seconds())
+        self.elapsed_secs = self._elapsed_offset + session_secs
         h, rem = divmod(self.elapsed_secs, 3600)
         m, s   = divmod(rem, 60)
         self.timer_var.set(f"{h:02d}:{m:02d}:{s:02d}")

@@ -84,9 +84,10 @@ class _HomeScreenState extends State<HomeScreen> {
   static const _bg3  = Color(0xFF0F3460);
 
   // Timer state
-  bool      _running   = false;
+  bool      _running         = false;
   DateTime? _startTime;
-  int       _elapsed   = 0;
+  int       _elapsed         = 0;   // display value (offset + session)
+  int       _elapsedOffset   = 0;   // carried over from previous sessions
   Timer?    _ticker;
 
   // Color selection
@@ -146,10 +147,10 @@ class _HomeScreenState extends State<HomeScreen> {
   Future<void> _resumeLastJob() async {
     if (_running) return;
     final prefs = await SharedPreferences.getInstance();
-    final elapsed  = prefs.getInt   (_kResumeElapsed) ?? 0;
-    final label    = prefs.getString (_kResumeLabel)  ?? '';
-    final comment  = prefs.getString (_kResumeComment) ?? '';
-    final colorHex = prefs.getString (_kResumeColor)  ?? '#4A90D9';
+    final elapsed  = prefs.getInt    (_kResumeElapsed)  ?? 0;
+    final label    = prefs.getString (_kResumeLabel)    ?? '';
+    final comment  = prefs.getString (_kResumeComment)  ?? '';
+    final colorHex = prefs.getString (_kResumeColor)    ?? '#4A90D9';
 
     // Parse saved color
     Color savedColor = _palette[0];
@@ -158,17 +159,22 @@ class _HomeScreenState extends State<HomeScreen> {
       savedColor = Color(int.parse(hex, radix: 16) | 0xFF000000);
     } catch (_) {}
 
+    // start_dt = now so the new entry only records THIS session's work.
+    // _elapsedOffset carries the previous total for display purposes only.
+    final now = DateTime.now();
     setState(() {
       _labelCtrl.text   = label;
       _commentCtrl.text = comment;
       _selectedColor    = savedColor;
+      _elapsedOffset    = elapsed;
       _elapsed          = elapsed;
       _running          = true;
-      _startTime        = DateTime.now().subtract(Duration(seconds: elapsed));
+      _startTime        = now;
     });
 
     _ticker = Timer.periodic(const Duration(seconds: 1), (_) {
-      setState(() => _elapsed = DateTime.now().difference(_startTime!).inSeconds);
+      setState(() => _elapsed = _elapsedOffset +
+          DateTime.now().difference(_startTime!).inSeconds);
     });
 
     await _clearResumeState();
@@ -219,9 +225,10 @@ class _HomeScreenState extends State<HomeScreen> {
 
   void _start() {
     setState(() {
-      _running   = true;
-      _startTime = DateTime.now();
-      _elapsed   = 0;
+      _running        = true;
+      _startTime      = DateTime.now();
+      _elapsed        = 0;
+      _elapsedOffset  = 0;
     });
     _ticker = Timer.periodic(const Duration(seconds: 1), (_) {
       setState(() => _elapsed = DateTime.now().difference(_startTime!).inSeconds);
@@ -233,9 +240,11 @@ class _HomeScreenState extends State<HomeScreen> {
     final endTime = DateTime.now();
     setState(() => _running = false);
 
-    final h = _elapsed ~/ 3600;
-    final m = (_elapsed % 3600) ~/ 60;
-    final s = _elapsed % 60;
+    // Record only this session's actual work (startTime is reset on each start/resume)
+    final actualSecs = endTime.difference(_startTime!).inSeconds;
+    final h = actualSecs ~/ 3600;
+    final m = (actualSecs % 3600) ~/ 60;
+    final s = actualSecs % 60;
     final durStr = '${h.toString().padLeft(2,'0')}:${m.toString().padLeft(2,'0')}:${s.toString().padLeft(2,'0')}';
 
     final colorHex = '#${_selectedColor.red.toRadixString(16).padLeft(2,'0')}'
@@ -247,7 +256,7 @@ class _HomeScreenState extends State<HomeScreen> {
       date:         _startTime!.toIso8601String().substring(0, 10),
       startTime:    _startTime!.toIso8601String().substring(11, 19),
       endTime:      endTime.toIso8601String().substring(11, 19),
-      durationSecs: _elapsed,
+      durationSecs: actualSecs,
       durationStr:  durStr,
       label:        _labelCtrl.text.trim(),
       tagColor:     colorHex,
@@ -259,7 +268,7 @@ class _HomeScreenState extends State<HomeScreen> {
 
     // Preserve context so this job can be resumed
     await _saveResumeState();
-    setState(() => _elapsed = 0);
+    setState(() { _elapsed = 0; _elapsedOffset = 0; });
   }
 
   String get _timerStr {
