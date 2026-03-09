@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:math';
 import 'package:flutter/material.dart';
 import 'package:go_router/go_router.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:uuid/uuid.dart';
 import '../models/entry.dart';
 import '../services/db_service.dart';
@@ -18,6 +19,13 @@ const _palette = [
   Color(0xFF1ABC9C), // Teal
   Color(0xFFF1C40F), // Yellow
 ];
+
+// ── Resume state keys ─────────────────────────────────────────────────────────
+const _kResumeElapsed  = 'resume_elapsed_secs';
+const _kResumeLabel    = 'resume_label';
+const _kResumeComment  = 'resume_comment';
+const _kResumeColor    = 'resume_tag_color';
+const _kResumeExists   = 'resume_exists';
 
 // ── Particle model ────────────────────────────────────────────────────────────
 class _Particle {
@@ -88,6 +96,9 @@ class _HomeScreenState extends State<HomeScreen> {
   final _labelCtrl   = TextEditingController();
   final _commentCtrl = TextEditingController();
 
+  // Resume state
+  bool _hasResume = false;
+
   // Particles
   final _rng       = Random();
   final _particles = <_Particle>[];
@@ -99,8 +110,71 @@ class _HomeScreenState extends State<HomeScreen> {
   @override
   void initState() {
     super.initState();
-    WidgetsBinding.instance.addPostFrameCallback((_) => _initParticles());
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _initParticles();
+      _checkResumeState();
+    });
   }
+
+  // ── Resume persistence ────────────────────────────────────────────────────
+
+  Future<void> _checkResumeState() async {
+    final prefs = await SharedPreferences.getInstance();
+    final exists = prefs.getBool(_kResumeExists) ?? false;
+    if (mounted) setState(() => _hasResume = exists);
+  }
+
+  Future<void> _saveResumeState() async {
+    final prefs = await SharedPreferences.getInstance();
+    final colorHex = '#${_selectedColor.red.toRadixString(16).padLeft(2, '0')}'
+                     '${_selectedColor.green.toRadixString(16).padLeft(2, '0')}'
+                     '${_selectedColor.blue.toRadixString(16).padLeft(2, '0')}';
+    await prefs.setBool  (_kResumeExists,  true);
+    await prefs.setInt   (_kResumeElapsed, _elapsed);
+    await prefs.setString(_kResumeLabel,   _labelCtrl.text.trim());
+    await prefs.setString(_kResumeComment, _commentCtrl.text.trim());
+    await prefs.setString(_kResumeColor,   colorHex);
+    if (mounted) setState(() => _hasResume = true);
+  }
+
+  Future<void> _clearResumeState() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_kResumeExists, false);
+    if (mounted) setState(() => _hasResume = false);
+  }
+
+  Future<void> _resumeLastJob() async {
+    if (_running) return;
+    final prefs = await SharedPreferences.getInstance();
+    final elapsed  = prefs.getInt   (_kResumeElapsed) ?? 0;
+    final label    = prefs.getString (_kResumeLabel)  ?? '';
+    final comment  = prefs.getString (_kResumeComment) ?? '';
+    final colorHex = prefs.getString (_kResumeColor)  ?? '#4A90D9';
+
+    // Parse saved color
+    Color savedColor = _palette[0];
+    try {
+      final hex = colorHex.startsWith('#') ? colorHex.substring(1) : colorHex;
+      savedColor = Color(int.parse(hex, radix: 16) | 0xFF000000);
+    } catch (_) {}
+
+    setState(() {
+      _labelCtrl.text   = label;
+      _commentCtrl.text = comment;
+      _selectedColor    = savedColor;
+      _elapsed          = elapsed;
+      _running          = true;
+      _startTime        = DateTime.now().subtract(Duration(seconds: elapsed));
+    });
+
+    _ticker = Timer.periodic(const Duration(seconds: 1), (_) {
+      setState(() => _elapsed = DateTime.now().difference(_startTime!).inSeconds);
+    });
+
+    await _clearResumeState();
+  }
+
+  // ── Particles ─────────────────────────────────────────────────────────────
 
   void _initParticles() {
     for (int i = 0; i < 16; i++) {
@@ -141,6 +215,8 @@ class _HomeScreenState extends State<HomeScreen> {
     super.dispose();
   }
 
+  // ── Timer logic ───────────────────────────────────────────────────────────
+
   void _start() {
     setState(() {
       _running   = true;
@@ -180,6 +256,9 @@ class _HomeScreenState extends State<HomeScreen> {
 
     await DbService.insertEntry(entry);
     SyncService.pushEntry(entry);
+
+    // Preserve context so this job can be resumed
+    await _saveResumeState();
     setState(() => _elapsed = 0);
   }
 
@@ -246,9 +325,11 @@ class _HomeScreenState extends State<HomeScreen> {
             ),
             const SizedBox(height: 16),
 
-            // Start / Stop buttons
-            Row(
-              mainAxisAlignment: MainAxisAlignment.center,
+            // Start / Stop / Resume buttons
+            Wrap(
+              alignment: WrapAlignment.center,
+              spacing: 12,
+              runSpacing: 8,
               children: [
                 ElevatedButton.icon(
                   onPressed: _running ? null : _start,
@@ -259,7 +340,6 @@ class _HomeScreenState extends State<HomeScreen> {
                     padding: const EdgeInsets.symmetric(horizontal: 32, vertical: 14),
                   ),
                 ),
-                const SizedBox(width: 16),
                 ElevatedButton.icon(
                   onPressed: _running ? _stop : null,
                   icon: const Icon(Icons.stop),
@@ -267,6 +347,18 @@ class _HomeScreenState extends State<HomeScreen> {
                   style: ElevatedButton.styleFrom(
                     backgroundColor: const Color(0xFFC0392B),
                     padding: const EdgeInsets.symmetric(horizontal: 32, vertical: 14),
+                  ),
+                ),
+                ElevatedButton.icon(
+                  onPressed: (!_running && _hasResume) ? _resumeLastJob : null,
+                  icon: const Icon(Icons.replay),
+                  label: const Text('RESUME LAST JOB'),
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: const Color(0xFF0F3460),
+                    foregroundColor: const Color(0xFF00D4FF),
+                    disabledBackgroundColor: const Color(0xFF0F3460).withOpacity(0.3),
+                    disabledForegroundColor: const Color(0xFF00D4FF).withOpacity(0.3),
+                    padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 14),
                   ),
                 ),
               ],

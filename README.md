@@ -9,7 +9,9 @@ A dark-themed desktop time tracker built with Python + Tkinter, with cloud sync 
 | Feature | Description |
 |---|---|
 | **Timer** | Start/stop with one click — saves date, start, end, duration automatically |
+| **Resume Last Job** | Restore the previous session's label, color, and elapsed time — picks up exactly where you left off, even after a crash or accidental close |
 | **Labels & Color Tags** | Tag sessions by project/client with 8 color codes |
+| **Add Entry** | Manually log time for a past session via the **+ Add Entry** button in the Time Log |
 | **Edit Entries** | Double-click any row to correct times or labels after the fact |
 | **Pull Hours** | Export all sessions to a clean, client-ready PDF time report |
 | **Create Invoice** | Select a label + hourly rate → generates a professional invoice PDF |
@@ -113,7 +115,11 @@ Generates an itemized invoice with per-session line items and a bold **Amount Du
 ## Data
 
 All data is stored locally in `timetracker.db` (SQLite, WAL mode).
-`config.json` stores your Supabase credentials and is excluded from git.
+`config.json` stores your Supabase credentials and resume state — excluded from git.
+
+### Resume state
+
+When you stop a timer or close the app mid-session, the current job's elapsed time, label, comment, and color tag are written to `config.json` under a `"resume"` key. On the next launch the **⏎ RESUME LAST JOB** button becomes active — clicking it restores all fields and continues the timer from where it left off. Accidental closes do **not** save a partial entry to the log; the time is only committed once you hit **STOP** after resuming.
 
 ---
 

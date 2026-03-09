@@ -25,7 +25,7 @@
 import tkinter as tk
 from tkinter import ttk, messagebox
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta
 import os
 import sys
 import json
@@ -336,7 +336,7 @@ class TimeTrackerApp:
     # ── Config I/O ────────────────────────────────────────────────────────────
 
     def _load_config(self) -> dict:
-        defaults = {"supabase_url": "", "supabase_key": ""}
+        defaults = {"supabase_url": "", "supabase_key": "", "resume": None}
         if not os.path.exists(CONFIG_PATH):
             try:
                 with open(CONFIG_PATH, "w") as f:
@@ -483,6 +483,16 @@ class TimeTrackerApp:
         )
         self.stop_btn.pack(side="left", padx=10)
 
+        has_resume = bool(self._config.get("resume"))
+        self.resume_btn = tk.Button(
+            btn_row, text="⏎  RESUME LAST JOB",
+            bg=BG3, fg="#00D4FF", activebackground=BG2, activeforeground="#00D4FF",
+            font=("Helvetica", 10, "bold"), relief="flat",
+            padx=18, pady=8, cursor="hand2", command=self._resume,
+            state="normal" if has_resume else "disabled",
+        )
+        self.resume_btn.pack(side="left", padx=10)
+
     def _build_input_section(self):
         outer = tk.Frame(self.root, bg=BG, padx=28, pady=0)
         outer.pack(fill="x")
@@ -554,6 +564,12 @@ class TimeTrackerApp:
             font=("Helvetica", 9), relief="flat", padx=10, pady=3,
             cursor="hand2", command=self._delete_selected,
         ).pack(side="right")
+        tk.Button(
+            hdr, text="+ Add Entry",
+            bg=ACCENT, fg="white", activebackground="#c73652", activeforeground="white",
+            font=("Helvetica", 9, "bold"), relief="flat", padx=10, pady=3,
+            cursor="hand2", command=self._open_add_dialog,
+        ).pack(side="right", padx=(0, 6))
         tk.Button(
             hdr, text="Create Invoice",
             bg=BG3, fg="#F1C40F", activebackground=BG2, activeforeground="#F1C40F",
@@ -659,6 +675,53 @@ class TimeTrackerApp:
 
     # ── Timer logic ───────────────────────────────────────────────────────────
 
+    def _save_resume_state(self):
+        """Persist current timer context so it can be resumed later."""
+        self._config["resume"] = {
+            "elapsed_secs": self.elapsed_secs,
+            "label":        self.label_var.get().strip(),
+            "comment":      self.comment_var.get().strip(),
+            "tag_color":    self.selected_color["hex"],
+        }
+        self._save_config()
+        if hasattr(self, "resume_btn"):
+            self.resume_btn.config(state="normal")
+
+    def _clear_resume_state(self):
+        self._config["resume"] = None
+        self._save_config()
+        if hasattr(self, "resume_btn"):
+            self.resume_btn.config(state="disabled")
+
+    def _resume(self):
+        """Resume the last saved timer state."""
+        state = self._config.get("resume")
+        if not state:
+            return
+        if self.running:
+            return
+
+        elapsed = state.get("elapsed_secs", 0)
+        label   = state.get("label",   "")
+        comment = state.get("comment", "")
+        color_hex = state.get("tag_color", PALETTE[0]["hex"])
+
+        # Restore input fields
+        self.label_var.set(label)
+        self.comment_var.set(comment)
+        color = next((c for c in PALETTE if c["hex"] == color_hex), PALETTE[0])
+        self._select_color(color)
+
+        # Start timer at saved elapsed time
+        self.running      = True
+        self.elapsed_secs = elapsed
+        self.start_dt     = datetime.now() - timedelta(seconds=elapsed)
+        self.start_btn.config(state="disabled")
+        self.stop_btn.config(state="normal")
+        self._tick()
+        self._pulse_running()
+        self._clear_resume_state()
+
     def _start(self):
         if self.running:
             return
@@ -680,14 +743,20 @@ class TimeTrackerApp:
         end_dt = datetime.now()
         self.start_btn.config(state="normal")
         self.stop_btn.config(state="disabled")
+        self._save_resume_state()   # preserve context so job can be resumed
         self._save_entry(end_dt)
         self.timer_var.set("00:00:00")
         self._timer_lbl.config(fg=ACCENT)   # reset pulse color
 
     def _on_close(self):
-        """Save any running session before closing."""
+        """Preserve running session state and close without saving a partial entry."""
         if self.running:
-            self._stop()
+            # Stop the tick but don't commit an entry — save resume state instead
+            self.running = False
+            if self._tick_job:
+                self.root.after_cancel(self._tick_job)
+                self._tick_job = None
+            self._save_resume_state()
         self.root.destroy()
 
     def _tick(self):
@@ -719,6 +788,159 @@ class TimeTrackerApp:
         )
 
     # ── Edit Dialog ───────────────────────────────────────────────────────────
+
+    def _open_add_dialog(self):
+        today = datetime.now().strftime("%Y-%m-%d")
+
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Add Entry")
+        dlg.configure(bg=BG)
+        dlg.resizable(False, False)
+        dlg.grab_set()
+
+        dlg.update_idletasks()
+        pw = self.root.winfo_x() + self.root.winfo_width()  // 2
+        ph = self.root.winfo_y() + self.root.winfo_height() // 2
+        dlg.geometry(f"460x420+{pw - 230}+{ph - 210}")
+
+        pad = {"padx": 18, "pady": 6}
+
+        def lbl_entry(parent, text, sv, readonly=False):
+            row = tk.Frame(parent, bg=BG)
+            row.pack(fill="x", **pad)
+            tk.Label(row, text=text, bg=BG, fg=TEXT2,
+                     font=("Helvetica", 10), width=14, anchor="w").pack(side="left")
+            state = "readonly" if readonly else "normal"
+            e = tk.Entry(row, textvariable=sv, bg=BG3, fg=TEXT,
+                         insertbackground=TEXT, font=("Helvetica", 11),
+                         relief="flat", bd=5, state=state,
+                         readonlybackground=BG2)
+            e.pack(side="left", fill="x", expand=True)
+            return e
+
+        sv_date    = tk.StringVar(value=today)
+        sv_start   = tk.StringVar(value="09:00:00")
+        sv_end     = tk.StringVar(value="10:00:00")
+        sv_dur     = tk.StringVar(value="01:00:00")
+        sv_label   = tk.StringVar()
+        sv_comment = tk.StringVar()
+
+        tk.Label(dlg, text="Add Entry", bg=BG, fg=TEXT,
+                 font=("Helvetica", 13, "bold")).pack(pady=(14, 4))
+
+        lbl_entry(dlg, "Date (YYYY-MM-DD):", sv_date)
+        e_start = lbl_entry(dlg, "Start (HH:MM:SS):", sv_start)
+        e_end   = lbl_entry(dlg, "End (HH:MM:SS):",   sv_end)
+        lbl_entry(dlg, "Duration:", sv_dur, readonly=True)
+        e_label = lbl_entry(dlg, "Label:", sv_label)
+        lbl_entry(dlg, "Comment:", sv_comment)
+        self._attach_autocomplete(e_label, sv_label, dlg)
+
+        def on_time_change(*_):
+            self._calc_duration_from_fields(sv_start, sv_end, sv_dur)
+
+        e_start.bind("<FocusOut>", on_time_change)
+        e_end.bind("<FocusOut>",   on_time_change)
+
+        # Color picker
+        color_row = tk.Frame(dlg, bg=BG)
+        color_row.pack(fill="x", padx=18, pady=6)
+        tk.Label(color_row, text="Color Tag:", bg=BG, fg=TEXT2,
+                 font=("Helvetica", 10), width=14, anchor="w").pack(side="left")
+
+        selected_color_var = {"hex": PALETTE[0]["hex"]}
+
+        def pick_color(c):
+            selected_color_var["hex"] = c["hex"]
+            for btn, pal in zip(color_btns, PALETTE):
+                if pal["hex"] == c["hex"]:
+                    btn.config(relief="solid", bd=3,
+                               highlightthickness=2, highlightbackground="white")
+                else:
+                    btn.config(relief="flat", bd=1, highlightthickness=0)
+
+        color_btns = []
+        for c in PALETTE:
+            b = tk.Button(
+                color_row, text="  ", bg=c["hex"],
+                relief="flat", bd=2, cursor="hand2", width=2,
+                command=lambda col=c: pick_color(col),
+                activebackground=c["hex"],
+            )
+            b.pack(side="left", padx=3)
+            color_btns.append(b)
+
+        pick_color(PALETTE[0])
+
+        status_lbl = tk.Label(dlg, text="", bg=BG, fg=RED_BTN,
+                               font=("Helvetica", 9))
+        status_lbl.pack()
+
+        btn_row = tk.Frame(dlg, bg=BG)
+        btn_row.pack(pady=8)
+
+        def save():
+            d   = sv_date.get().strip()
+            s   = sv_start.get().strip()
+            e   = sv_end.get().strip()
+            lbl = sv_label.get().strip()
+            cmt = sv_comment.get().strip()
+            clr = selected_color_var["hex"]
+
+            try:
+                datetime.strptime(d, "%Y-%m-%d")
+            except ValueError:
+                status_lbl.config(text="Invalid date — use YYYY-MM-DD")
+                return
+
+            try:
+                dt_s = datetime.strptime(s, "%H:%M:%S")
+                dt_e = datetime.strptime(e, "%H:%M:%S")
+            except ValueError:
+                status_lbl.config(text="Invalid time — use HH:MM:SS")
+                return
+
+            if dt_e <= dt_s:
+                status_lbl.config(text="End time must be after start time")
+                return
+
+            delta = int((dt_e - dt_s).total_seconds())
+            h2, r2 = divmod(delta, 3600)
+            m2, s2 = divmod(r2, 60)
+            dur_str = f"{h2:02d}:{m2:02d}:{s2:02d}"
+            sync_id = str(uuid.uuid4())
+
+            try:
+                with sqlite3.connect(DB_PATH) as conn:
+                    conn.execute("""
+                        INSERT INTO entries
+                          (date, start_time, end_time, duration_secs, duration_str,
+                           label, tag_color, comment, sync_id, synced)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+                    """, (d, s, e, delta, dur_str, lbl, clr, cmt, sync_id))
+            except sqlite3.Error as exc:
+                status_lbl.config(text=f"DB error: {exc}")
+                return
+
+            self._load_entries()
+            threading.Thread(
+                target=self._sync_push_entry, args=(sync_id,), daemon=True
+            ).start()
+            dlg.destroy()
+
+        tk.Button(
+            btn_row, text="Save",
+            bg=GREEN, fg="white", activebackground="#2ECC71", activeforeground="white",
+            font=("Helvetica", 11, "bold"), relief="flat",
+            padx=22, pady=6, cursor="hand2", command=save,
+        ).pack(side="left", padx=10)
+
+        tk.Button(
+            btn_row, text="Cancel",
+            bg=BG3, fg=TEXT2, activebackground=BG2, activeforeground=TEXT,
+            font=("Helvetica", 11), relief="flat",
+            padx=22, pady=6, cursor="hand2", command=dlg.destroy,
+        ).pack(side="left", padx=10)
 
     def _open_edit_dialog(self, event=None):
         sel = self.tree.selection()
