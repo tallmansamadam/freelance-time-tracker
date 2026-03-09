@@ -50,7 +50,7 @@ class DbService {
   }
 
   static Future<List<Entry>> allEntries() async {
-    final rows = await (await db).query('entries', orderBy: 'id DESC');
+    final rows = await (await db).query('entries', orderBy: 'date DESC, start_time DESC');
     return rows.map(Entry.fromMap).toList();
   }
 

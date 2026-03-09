@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:go_router/go_router.dart';
 import '../services/db_service.dart';
 import '../models/entry.dart';
 
@@ -61,7 +62,17 @@ class _InvoiceScreenState extends State<InvoiceScreen> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text('CREATE INVOICE')),
+      appBar: AppBar(
+        title: const Text('CREATE INVOICE'),
+        leading: BackButton(onPressed: () => context.pop()),
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.home),
+            tooltip: 'Home',
+            onPressed: () => context.go('/'),
+          ),
+        ],
+      ),
       body: Padding(
         padding: const EdgeInsets.all(24),
         child: Column(

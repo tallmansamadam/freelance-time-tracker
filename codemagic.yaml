@@ -1,0 +1,125 @@
+workflows:
+  ios-release:
+    name: iOS Release
+    max_build_duration: 60
+    environment:
+      flutter: stable
+      xcode: latest
+      cocoapods: default
+      ios_signing:
+        distribution_type: app_store
+        bundle_identifier: com.yourname.timetracker   # ← change this
+      vars:
+        BUNDLE_ID: com.yourname.timetracker           # ← change this to match above
+      app_store_connect:
+        api_key: $APP_STORE_CONNECT_PRIVATE_KEY       # set in Codemagic dashboard
+        key_id: $APP_STORE_CONNECT_KEY_IDENTIFIER     # set in Codemagic dashboard
+        issuer_id: $APP_STORE_CONNECT_ISSUER_ID       # set in Codemagic dashboard
+
+    working_directory: timetracker_flutter
+
+    scripts:
+      - name: Get Flutter packages
+        script: flutter pub get
+
+      - name: Install CocoaPods
+        script: |
+          find . -name "Podfile" -execdir pod install \;
+
+      - name: Build iOS release
+        script: |
+          flutter build ios --release --no-codesign
+
+      - name: Package and sign IPA
+        script: |
+          xcode-project use-profiles
+          xcode-project build-ipa \
+            --workspace ios/Runner.xcworkspace \
+            --scheme Runner
+
+    artifacts:
+      - build/ios/ipa/*.ipa
+      - /tmp/xcodebuild_logs/*.log
+      - flutter_drive.log
+
+    publishing:
+      app_store_connect:
+        auth: integration
+        submit_to_testflight: true   # sends to TestFlight for internal testing first
+        submit_to_app_store: false   # flip to true when ready for public release
+
+  android-release:
+    name: Android Release
+    max_build_duration: 60
+    environment:
+      flutter: stable
+      android_signing:
+        - keystore_reference              # ← set up keystore in Codemagic dashboard
+      vars:
+        PACKAGE_NAME: com.yourname.timetracker   # ← change this to match your app ID
+
+    working_directory: timetracker_flutter
+
+    scripts:
+      - name: Get Flutter packages
+        script: flutter pub get
+
+      - name: Build Android App Bundle
+        script: |
+          flutter build appbundle --release \
+            --build-name=1.0.0 \
+            --build-number=$(($(google-play get-latest-build-number \
+              --package-name "$PACKAGE_NAME" \
+              --tracks=alpha,beta,production) + 1))
+
+    artifacts:
+      - build/app/outputs/bundle/release/app-release.aab
+      - build/app/outputs/mapping/release/mapping.txt
+
+    publishing:
+      google_play:
+        credentials: $GCLOUD_SERVICE_ACCOUNT_CREDENTIALS  # set in Codemagic dashboard
+        track: internal        # internal → alpha → beta → production
+        submit_as_draft: true  # flip to false to publish immediately
+
+  macos-release:
+    name: macOS Release
+    max_build_duration: 60
+    environment:
+      flutter: stable
+      xcode: latest
+      cocoapods: default
+      mac_signing:
+        distribution_type: mac_app_store
+        bundle_identifier: com.yourname.timetracker   # ← change this
+      app_store_connect:
+        api_key: $APP_STORE_CONNECT_PRIVATE_KEY       # same key as iOS
+        key_id: $APP_STORE_CONNECT_KEY_IDENTIFIER
+        issuer_id: $APP_STORE_CONNECT_ISSUER_ID
+
+    working_directory: timetracker_flutter
+
+    scripts:
+      - name: Get Flutter packages
+        script: flutter pub get
+
+      - name: Build macOS release
+        script: |
+          flutter build macos --release
+
+      - name: Package for Mac App Store
+        script: |
+          xcode-project use-profiles
+          xcode-project build-ipa \
+            --workspace macos/Runner.xcworkspace \
+            --scheme Runner
+
+    artifacts:
+      - build/macos/Build/Products/Release/*.pkg
+      - /tmp/xcodebuild_logs/*.log
+
+    publishing:
+      app_store_connect:
+        auth: integration
+        submit_to_testflight: true
+        submit_to_app_store: false   # flip to true when ready for public release

@@ -113,8 +113,10 @@ class TimeTrackerApp:
         self._update_clock()
         self._load_entries()
         self._sync_push_pending()   # background sweep on startup
+        self._sync_pull_remote()    # pull remote entries from Supabase on startup
         self._startup_connect()     # test saved credentials, update sync dot
         self._start_animations()    # decorative canvas loop
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
     # ── Database ──────────────────────────────────────────────────────────────
 
@@ -682,6 +684,12 @@ class TimeTrackerApp:
         self.timer_var.set("00:00:00")
         self._timer_lbl.config(fg=ACCENT)   # reset pulse color
 
+    def _on_close(self):
+        """Save any running session before closing."""
+        if self.running:
+            self._stop()
+        self.root.destroy()
+
     def _tick(self):
         if not self.running:
             return
@@ -1179,6 +1187,40 @@ class TimeTrackerApp:
                 threading.Thread(
                     target=self._sync_push_entry, args=(sync_id,), daemon=True
                 ).start()
+
+    def _sync_pull_remote(self):
+        """On startup, pull all remote Supabase entries into local DB."""
+        threading.Thread(target=self._bg_sync_pull_remote, daemon=True).start()
+
+    def _bg_sync_pull_remote(self):
+        client = self._get_supabase_client()
+        if client is None:
+            return
+        try:
+            rows = client.table("entries").select("*").execute().data
+        except Exception:
+            return
+        if not rows:
+            return
+        with sqlite3.connect(DB_PATH) as conn:
+            for r in rows:
+                conn.execute("""
+                    INSERT OR REPLACE INTO entries
+                        (sync_id, date, start_time, end_time,
+                         duration_secs, duration_str, label, tag_color, comment, synced)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+                """, (
+                    r.get("sync_id", ""),
+                    r.get("date", ""),
+                    r.get("start_time", ""),
+                    r.get("end_time", ""),
+                    r.get("duration_secs", 0),
+                    r.get("duration_str", ""),
+                    r.get("label", ""),
+                    r.get("tag_color", ""),
+                    r.get("comment", ""),
+                ))
+        self.root.after(0, self._load_entries)
 
     def _startup_connect(self):
         """If credentials are saved, test the connection in a background thread
