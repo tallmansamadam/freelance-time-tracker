@@ -175,12 +175,6 @@ class TimeTrackerApp:
                 )
 
             # Check whether sync_id already has a UNIQUE index
-            has_unique = any(
-                row[2] == "entries" and "sync_id" in (row[8] or "")
-                for row in conn.execute("PRAGMA index_list(entries)")
-                for row in [conn.execute(f"PRAGMA index_info({row[1]})").fetchall()]
-            )
-            # Simpler: check sqlite_master for a unique index on sync_id
             has_unique = conn.execute("""
                 SELECT COUNT(*) FROM sqlite_master
                 WHERE type='index' AND tbl_name='entries'
