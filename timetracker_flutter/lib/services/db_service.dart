@@ -35,9 +35,16 @@ class DbService {
     );
   }
 
+  /// Insert a new entry; replace on sync_id conflict (local writes).
   static Future<int> insertEntry(Entry e) async {
     return (await db).insert('entries', e.toMap(),
         conflictAlgorithm: ConflictAlgorithm.replace);
+  }
+
+  /// Insert from a remote pull; ignore if sync_id already exists locally.
+  static Future<void> insertEntryIgnore(Entry e) async {
+    await (await db).insert('entries', e.toMap(),
+        conflictAlgorithm: ConflictAlgorithm.ignore);
   }
 
   static Future<void> updateEntry(Entry e) async {

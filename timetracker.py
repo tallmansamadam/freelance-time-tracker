@@ -59,7 +59,6 @@ _APP_DIR    = (os.path.dirname(sys.executable) if getattr(sys, "frozen", False)
                else os.path.dirname(os.path.abspath(__file__)))
 DB_PATH     = os.path.join(_APP_DIR, "timetracker.db")
 CONFIG_PATH = os.path.join(_APP_DIR, "config.json")
-RESUME_PATH = os.path.join(_APP_DIR, "resume.json")
 
 # ── Color palette ─────────────────────────────────────────────────────────────
 PALETTE = [
@@ -138,21 +137,34 @@ class TimeTrackerApp:
                     comment       TEXT    DEFAULT ''
                 )
             """)
+            # Single-row table for persisting resume state inside the DB
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS resume_state (
+                    id            INTEGER PRIMARY KEY CHECK (id = 1),
+                    elapsed_secs  INTEGER NOT NULL,
+                    label         TEXT    DEFAULT '',
+                    comment       TEXT    DEFAULT '',
+                    tag_color     TEXT    DEFAULT ''
+                )
+            """)
         self._migrate_db()
 
     def _migrate_db(self):
-        """Safely add sync_id / synced columns to existing databases."""
+        """
+        Ensure sync_id and synced columns exist, backfill any missing sync_ids,
+        then rebuild the table with UNIQUE(sync_id) if not already present —
+        which is what makes INSERT OR IGNORE deduplicate correctly on sync pulls.
+        """
         with sqlite3.connect(DB_PATH) as conn:
             conn.execute("PRAGMA journal_mode=WAL")
             existing = {row[1] for row in conn.execute("PRAGMA table_info(entries)")}
 
             if "sync_id" not in existing:
                 conn.execute("ALTER TABLE entries ADD COLUMN sync_id TEXT")
-
             if "synced" not in existing:
                 conn.execute("ALTER TABLE entries ADD COLUMN synced INTEGER DEFAULT 0")
 
-            # Backfill sync_id for rows that don't have one yet
+            # Backfill any rows that still lack a sync_id
             rows = conn.execute(
                 "SELECT id FROM entries WHERE sync_id IS NULL OR sync_id = ''"
             ).fetchall()
@@ -161,6 +173,57 @@ class TimeTrackerApp:
                     "UPDATE entries SET sync_id = ? WHERE id = ?",
                     (str(uuid.uuid4()), row_id),
                 )
+
+            # Check whether sync_id already has a UNIQUE index
+            has_unique = any(
+                row[2] == "entries" and "sync_id" in (row[8] or "")
+                for row in conn.execute("PRAGMA index_list(entries)")
+                for row in [conn.execute(f"PRAGMA index_info({row[1]})").fetchall()]
+            )
+            # Simpler: check sqlite_master for a unique index on sync_id
+            has_unique = conn.execute("""
+                SELECT COUNT(*) FROM sqlite_master
+                WHERE type='index' AND tbl_name='entries'
+                  AND sql LIKE '%UNIQUE%' AND sql LIKE '%sync_id%'
+            """).fetchone()[0] > 0
+
+            if not has_unique:
+                # Rebuild table to add UNIQUE(sync_id), removing duplicates first
+                # (keep the row with the lowest id for each sync_id)
+                conn.execute("""
+                    DELETE FROM entries WHERE id NOT IN (
+                        SELECT MIN(id) FROM entries
+                        WHERE sync_id IS NOT NULL AND sync_id != ''
+                        GROUP BY sync_id
+                    ) AND sync_id IS NOT NULL AND sync_id != ''
+                """)
+                conn.execute("""
+                    CREATE TABLE entries_new (
+                        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                        sync_id       TEXT    UNIQUE NOT NULL,
+                        date          TEXT    NOT NULL,
+                        start_time    TEXT    NOT NULL,
+                        end_time      TEXT    NOT NULL,
+                        duration_secs INTEGER NOT NULL,
+                        duration_str  TEXT    NOT NULL,
+                        label         TEXT    DEFAULT '',
+                        tag_color     TEXT    DEFAULT '',
+                        comment       TEXT    DEFAULT '',
+                        synced        INTEGER DEFAULT 0
+                    )
+                """)
+                conn.execute("""
+                    INSERT INTO entries_new
+                        (sync_id, date, start_time, end_time, duration_secs,
+                         duration_str, label, tag_color, comment, synced)
+                    SELECT sync_id, date, start_time, end_time, duration_secs,
+                           duration_str, label, tag_color, comment,
+                           COALESCE(synced, 0)
+                    FROM entries
+                    WHERE sync_id IS NOT NULL AND sync_id != ''
+                """)
+                conn.execute("DROP TABLE entries")
+                conn.execute("ALTER TABLE entries_new RENAME TO entries")
 
     def _save_entry(self, end_dt: datetime):
         # Use actual session duration (start_dt is reset to now on each start/resume)
@@ -257,6 +320,9 @@ class TimeTrackerApp:
                     SELECT id, date, start_time, end_time, duration_str,
                            label, tag_color, comment
                     FROM entries
+                    WHERE id IN (
+                        SELECT MIN(id) FROM entries GROUP BY sync_id
+                    )
                     ORDER BY id DESC
                 """).fetchall()
         except sqlite3.Error as exc:
@@ -293,6 +359,7 @@ class TimeTrackerApp:
                            SUM(e.duration_secs)
                     FROM entries e
                     WHERE e.label IS NOT NULL AND e.label != ''
+                      AND e.id IN (SELECT MIN(id) FROM entries GROUP BY sync_id)
                     GROUP BY e.label
                     ORDER BY SUM(e.duration_secs) DESC
                 """).fetchall()
@@ -327,9 +394,11 @@ class TimeTrackerApp:
         today = datetime.now().strftime("%Y-%m-%d")
         try:
             with sqlite3.connect(DB_PATH) as conn:
-                result = conn.execute(
-                    "SELECT SUM(duration_secs) FROM entries WHERE date = ?", (today,)
-                ).fetchone()
+                result = conn.execute("""
+                    SELECT SUM(duration_secs) FROM entries
+                    WHERE date = ?
+                      AND id IN (SELECT MIN(id) FROM entries GROUP BY sync_id)
+                """, (today,)).fetchone()
         except sqlite3.Error:
             return   # non-critical display; fail silently
         total_secs = result[0] or 0
@@ -680,38 +749,49 @@ class TimeTrackerApp:
     # ── Timer logic ───────────────────────────────────────────────────────────
 
     def _save_resume_state(self):
-        """Persist current timer context to resume.json so it can be resumed later."""
-        state = {
-            "elapsed_secs": self.elapsed_secs,
-            "label":        self.label_var.get().strip(),
-            "comment":      self.comment_var.get().strip(),
-            "tag_color":    self.selected_color["hex"],
-        }
+        """Persist current timer context inside the SQLite DB (resume_state table)."""
         try:
-            with open(RESUME_PATH, "w") as f:
-                json.dump(state, f, indent=2)
-        except OSError:
+            with sqlite3.connect(DB_PATH) as conn:
+                conn.execute("""
+                    INSERT INTO resume_state (id, elapsed_secs, label, comment, tag_color)
+                    VALUES (1, ?, ?, ?, ?)
+                    ON CONFLICT(id) DO UPDATE SET
+                        elapsed_secs = excluded.elapsed_secs,
+                        label        = excluded.label,
+                        comment      = excluded.comment,
+                        tag_color    = excluded.tag_color
+                """, (
+                    self.elapsed_secs,
+                    self.label_var.get().strip(),
+                    self.comment_var.get().strip(),
+                    self.selected_color["hex"],
+                ))
+        except sqlite3.Error:
             pass
         if hasattr(self, "resume_btn"):
             self.resume_btn.config(state="normal")
 
     def _clear_resume_state(self):
         try:
-            if os.path.exists(RESUME_PATH):
-                os.remove(RESUME_PATH)
-        except OSError:
+            with sqlite3.connect(DB_PATH) as conn:
+                conn.execute("DELETE FROM resume_state WHERE id = 1")
+        except sqlite3.Error:
             pass
         if hasattr(self, "resume_btn"):
             self.resume_btn.config(state="disabled")
 
-    def _load_resume_state(self) -> dict | None:
-        if not os.path.exists(RESUME_PATH):
-            return None
+    def _load_resume_state(self):
         try:
-            with open(RESUME_PATH) as f:
-                return json.load(f)
-        except (json.JSONDecodeError, OSError):
-            return None
+            with sqlite3.connect(DB_PATH) as conn:
+                row = conn.execute(
+                    "SELECT elapsed_secs, label, comment, tag_color FROM resume_state WHERE id = 1"
+                ).fetchone()
+            if row:
+                return {"elapsed_secs": row[0], "label": row[1],
+                        "comment": row[2], "tag_color": row[3]}
+        except sqlite3.Error:
+            pass
+        return None
 
     def _resume(self):
         """Resume the last saved timer state."""
@@ -1451,7 +1531,7 @@ class TimeTrackerApp:
         with sqlite3.connect(DB_PATH) as conn:
             for r in rows:
                 conn.execute("""
-                    INSERT OR REPLACE INTO entries
+                    INSERT OR IGNORE INTO entries
                         (sync_id, date, start_time, end_time,
                          duration_secs, duration_str, label, tag_color, comment, synced)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)

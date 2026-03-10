@@ -40,6 +40,8 @@ class SyncService {
   }
 
   /// On startup: pull all remote entries into local DB (offline-first merge).
+  /// Uses INSERT OR IGNORE (via ConflictAlgorithm.ignore) so existing local
+  /// rows are never overwritten — sync_id UNIQUE constraint prevents duplicates.
   static Future<void> pullEntries() async {
     try {
       final rows = await _client.from('entries').select();
@@ -49,7 +51,7 @@ class SyncService {
         map.remove('id');
         map.remove('created_at');
         map['synced'] = 1;
-        await DbService.insertEntry(Entry.fromMap(map));
+        await DbService.insertEntryIgnore(Entry.fromMap(map));
       }
     } catch (e) {
       debugPrint('[Sync] pullEntries FAILED: $e');
