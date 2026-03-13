@@ -94,8 +94,9 @@ class TimeTrackerApp:
         self.running          = False
         self.start_dt         = None
         self.elapsed_secs     = 0
-        self._elapsed_offset  = 0   # accumulated secs from previous sessions (resume)
-        self._tick_job        = None
+        self._elapsed_offset    = 0   # accumulated secs from previous sessions (resume)
+        self._checkpoint_sync_id = None  # sync_id shared by checkpoint + final entry
+        self._tick_job          = None
         self.selected_color = PALETTE[0]
         self._color_btns    = []
 
@@ -164,6 +165,13 @@ class TimeTrackerApp:
             if "synced" not in existing:
                 conn.execute("ALTER TABLE entries ADD COLUMN synced INTEGER DEFAULT 0")
 
+            # Add checkpoint_sync_id to resume_state if not present
+            rs_cols = {row[1] for row in conn.execute("PRAGMA table_info(resume_state)")}
+            if "checkpoint_sync_id" not in rs_cols:
+                conn.execute(
+                    "ALTER TABLE resume_state ADD COLUMN checkpoint_sync_id TEXT DEFAULT ''"
+                )
+
             # Backfill any rows that still lack a sync_id
             rows = conn.execute(
                 "SELECT id FROM entries WHERE sync_id IS NULL OR sync_id = ''"
@@ -231,7 +239,8 @@ class TimeTrackerApp:
         label     = self.label_var.get().strip()
         comment   = self.comment_var.get().strip()
         tag_color = self.selected_color["hex"]
-        sync_id   = str(uuid.uuid4())
+        sync_id   = self._checkpoint_sync_id or str(uuid.uuid4())
+        self._checkpoint_sync_id = None
 
         try:
             with sqlite3.connect(DB_PATH) as conn:
@@ -240,6 +249,14 @@ class TimeTrackerApp:
                       (date, start_time, end_time, duration_secs, duration_str,
                        label, tag_color, comment, sync_id, synced)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+                    ON CONFLICT(sync_id) DO UPDATE SET
+                        end_time      = excluded.end_time,
+                        duration_secs = excluded.duration_secs,
+                        duration_str  = excluded.duration_str,
+                        label         = excluded.label,
+                        tag_color     = excluded.tag_color,
+                        comment       = excluded.comment,
+                        synced        = 0
                 """, (date, start_str, end_str, actual_secs, dur_str,
                       label, tag_color, comment, sync_id))
         except sqlite3.Error as exc:
@@ -747,23 +764,63 @@ class TimeTrackerApp:
         try:
             with sqlite3.connect(DB_PATH) as conn:
                 conn.execute("""
-                    INSERT INTO resume_state (id, elapsed_secs, label, comment, tag_color)
-                    VALUES (1, ?, ?, ?, ?)
+                    INSERT INTO resume_state (id, elapsed_secs, label, comment, tag_color, checkpoint_sync_id)
+                    VALUES (1, ?, ?, ?, ?, ?)
                     ON CONFLICT(id) DO UPDATE SET
-                        elapsed_secs = excluded.elapsed_secs,
-                        label        = excluded.label,
-                        comment      = excluded.comment,
-                        tag_color    = excluded.tag_color
+                        elapsed_secs       = excluded.elapsed_secs,
+                        label              = excluded.label,
+                        comment            = excluded.comment,
+                        tag_color          = excluded.tag_color,
+                        checkpoint_sync_id = excluded.checkpoint_sync_id
                 """, (
                     self.elapsed_secs,
                     self.label_var.get().strip(),
                     self.comment_var.get().strip(),
                     self.selected_color["hex"],
+                    self._checkpoint_sync_id or "",
                 ))
         except sqlite3.Error:
             pass
         if hasattr(self, "resume_btn"):
             self.resume_btn.config(state="normal")
+
+    def _save_checkpoint(self):
+        """Upsert a partial entry so work is committed to the DB every 30 s."""
+        if not self._checkpoint_sync_id or not self.start_dt:
+            return
+        end_dt      = datetime.now()
+        actual_secs = int((end_dt - self.start_dt).total_seconds())
+        h, rem  = divmod(actual_secs, 3600)
+        m, s    = divmod(rem, 60)
+        dur_str = f"{h:02d}:{m:02d}:{s:02d}"
+        try:
+            with sqlite3.connect(DB_PATH) as conn:
+                conn.execute("""
+                    INSERT INTO entries
+                      (date, start_time, end_time, duration_secs, duration_str,
+                       label, tag_color, comment, sync_id, synced)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+                    ON CONFLICT(sync_id) DO UPDATE SET
+                        end_time      = excluded.end_time,
+                        duration_secs = excluded.duration_secs,
+                        duration_str  = excluded.duration_str,
+                        label         = excluded.label,
+                        tag_color     = excluded.tag_color,
+                        comment       = excluded.comment,
+                        synced        = 0
+                """, (
+                    self.start_dt.strftime("%Y-%m-%d"),
+                    self.start_dt.strftime("%H:%M:%S"),
+                    end_dt.strftime("%H:%M:%S"),
+                    actual_secs, dur_str,
+                    self.label_var.get().strip(),
+                    self.selected_color["hex"],
+                    self.comment_var.get().strip(),
+                    self._checkpoint_sync_id,
+                ))
+        except sqlite3.Error:
+            pass
+        self._load_entries()
 
     def _clear_resume_state(self):
         try:
@@ -778,11 +835,12 @@ class TimeTrackerApp:
         try:
             with sqlite3.connect(DB_PATH) as conn:
                 row = conn.execute(
-                    "SELECT elapsed_secs, label, comment, tag_color FROM resume_state WHERE id = 1"
+                    "SELECT elapsed_secs, label, comment, tag_color, checkpoint_sync_id FROM resume_state WHERE id = 1"
                 ).fetchone()
             if row:
                 return {"elapsed_secs": row[0], "label": row[1],
-                        "comment": row[2], "tag_color": row[3]}
+                        "comment": row[2], "tag_color": row[3],
+                        "checkpoint_sync_id": row[4] or ""}
         except sqlite3.Error:
             pass
         return None
@@ -806,12 +864,13 @@ class TimeTrackerApp:
         color = next((c for c in PALETTE if c["hex"] == color_hex), PALETTE[0])
         self._select_color(color)
 
-        # Start timer continuing from saved elapsed, but start_dt is NOW so
-        # the new entry only records this session's actual work time.
-        self._elapsed_offset = elapsed
-        self.elapsed_secs    = elapsed
-        self.start_dt        = datetime.now()
-        self.running         = True
+        # start_dt = now so this segment's entry records only the time since
+        # resume. _elapsed_offset carries the previous total for display only.
+        self._elapsed_offset     = elapsed
+        self._checkpoint_sync_id = str(uuid.uuid4())
+        self.elapsed_secs        = elapsed
+        self.start_dt            = datetime.now()
+        self.running             = True
         self.start_btn.config(state="disabled")
         self.stop_btn.config(state="normal")
         self._clear_resume_state()
@@ -821,10 +880,11 @@ class TimeTrackerApp:
     def _start(self):
         if self.running:
             return
-        self._elapsed_offset = 0
-        self.running         = True
-        self.start_dt        = datetime.now()
-        self.elapsed_secs    = 0
+        self._elapsed_offset     = 0
+        self._checkpoint_sync_id = str(uuid.uuid4())
+        self.running             = True
+        self.start_dt            = datetime.now()
+        self.elapsed_secs        = 0
         self.start_btn.config(state="disabled")
         self.stop_btn.config(state="normal")
         self._tick()
@@ -864,6 +924,10 @@ class TimeTrackerApp:
         h, rem = divmod(self.elapsed_secs, 3600)
         m, s   = divmod(rem, 60)
         self.timer_var.set(f"{h:02d}:{m:02d}:{s:02d}")
+        # Checkpoint every 30 s: commit partial entry + update resume state
+        if session_secs > 0 and session_secs % 30 == 0:
+            self._save_resume_state()
+            self._save_checkpoint()
         self._tick_job = self.root.after(1000, self._tick)
 
     def _update_clock(self):

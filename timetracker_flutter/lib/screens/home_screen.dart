@@ -79,7 +79,7 @@ class HomeScreen extends StatefulWidget {
   State<HomeScreen> createState() => _HomeScreenState();
 }
 
-class _HomeScreenState extends State<HomeScreen> {
+class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   static const _bg2  = Color(0xFF16213E);
   static const _bg3  = Color(0xFF0F3460);
 
@@ -97,6 +97,9 @@ class _HomeScreenState extends State<HomeScreen> {
   final _labelCtrl   = TextEditingController();
   final _commentCtrl = TextEditingController();
 
+  // Checkpoint: shared sync_id for in-progress entry (updated every 30 s)
+  String? _checkpointSyncId;
+
   // Resume state
   bool _hasResume = false;
 
@@ -111,10 +114,23 @@ class _HomeScreenState extends State<HomeScreen> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     WidgetsBinding.instance.addPostFrameCallback((_) {
       _initParticles();
       _checkResumeState();
     });
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    // Save resume state immediately when the app is backgrounded or closed
+    // so a kill between 30 s checkpoints doesn't lose the current elapsed time.
+    if (_running &&
+        (state == AppLifecycleState.paused ||
+         state == AppLifecycleState.detached)) {
+      _saveResumeState();
+      _saveCheckpoint(DateTime.now().difference(_startTime!).inSeconds);
+    }
   }
 
   // ── Resume persistence ────────────────────────────────────────────────────
@@ -144,6 +160,30 @@ class _HomeScreenState extends State<HomeScreen> {
     if (mounted) setState(() => _hasResume = false);
   }
 
+  Future<void> _saveCheckpoint(int sessionSecs) async {
+    if (_checkpointSyncId == null || _startTime == null) return;
+    final endTime = DateTime.now();
+    final h = sessionSecs ~/ 3600;
+    final m = (sessionSecs % 3600) ~/ 60;
+    final s = sessionSecs % 60;
+    final durStr = '${h.toString().padLeft(2,'0')}:${m.toString().padLeft(2,'0')}:${s.toString().padLeft(2,'0')}';
+    final colorHex = '#${_selectedColor.red.toRadixString(16).padLeft(2,'0')}'
+                     '${_selectedColor.green.toRadixString(16).padLeft(2,'0')}'
+                     '${_selectedColor.blue.toRadixString(16).padLeft(2,'0')}';
+    final entry = Entry(
+      syncId:       _checkpointSyncId!,
+      date:         _startTime!.toIso8601String().substring(0, 10),
+      startTime:    _startTime!.toIso8601String().substring(11, 19),
+      endTime:      endTime.toIso8601String().substring(11, 19),
+      durationSecs: sessionSecs,
+      durationStr:  durStr,
+      label:        _labelCtrl.text.trim(),
+      tagColor:     colorHex,
+      comment:      _commentCtrl.text.trim(),
+    );
+    await DbService.insertEntry(entry);
+  }
+
   Future<void> _resumeLastJob() async {
     if (_running) return;
     final prefs = await SharedPreferences.getInstance();
@@ -159,8 +199,8 @@ class _HomeScreenState extends State<HomeScreen> {
       savedColor = Color(int.parse(hex, radix: 16) | 0xFF000000);
     } catch (_) {}
 
-    // start_dt = now so the new entry only records THIS session's work.
-    // _elapsedOffset carries the previous total for display purposes only.
+    // start_dt = now so this segment's entry records only the time since
+    // resume. _elapsedOffset carries the previous total for display only.
     final now = DateTime.now();
     setState(() {
       _labelCtrl.text   = label;
@@ -172,9 +212,15 @@ class _HomeScreenState extends State<HomeScreen> {
       _startTime        = now;
     });
 
+    _checkpointSyncId = const Uuid().v4();
     _ticker = Timer.periodic(const Duration(seconds: 1), (_) {
-      setState(() => _elapsed = _elapsedOffset +
-          DateTime.now().difference(_startTime!).inSeconds);
+      final sessionSecs = DateTime.now().difference(_startTime!).inSeconds;
+      setState(() => _elapsed = _elapsedOffset + sessionSecs);
+      // Checkpoint every 30 s: commit partial entry + update resume state
+      if (sessionSecs > 0 && sessionSecs % 30 == 0) {
+        _saveResumeState();
+        _saveCheckpoint(sessionSecs);
+      }
     });
 
     await _clearResumeState();
@@ -214,6 +260,7 @@ class _HomeScreenState extends State<HomeScreen> {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _ticker?.cancel();
     _animTicker?.cancel();
     _labelCtrl.dispose();
@@ -224,6 +271,7 @@ class _HomeScreenState extends State<HomeScreen> {
   // ── Timer logic ───────────────────────────────────────────────────────────
 
   void _start() {
+    _checkpointSyncId = const Uuid().v4();
     setState(() {
       _running        = true;
       _startTime      = DateTime.now();
@@ -231,7 +279,13 @@ class _HomeScreenState extends State<HomeScreen> {
       _elapsedOffset  = 0;
     });
     _ticker = Timer.periodic(const Duration(seconds: 1), (_) {
-      setState(() => _elapsed = DateTime.now().difference(_startTime!).inSeconds);
+      final sessionSecs = DateTime.now().difference(_startTime!).inSeconds;
+      setState(() => _elapsed = sessionSecs);
+      // Checkpoint every 30 s: commit partial entry + update resume state
+      if (sessionSecs > 0 && sessionSecs % 30 == 0) {
+        _saveResumeState();
+        _saveCheckpoint(sessionSecs);
+      }
     });
   }
 
@@ -251,8 +305,10 @@ class _HomeScreenState extends State<HomeScreen> {
                      '${_selectedColor.green.toRadixString(16).padLeft(2,'0')}'
                      '${_selectedColor.blue.toRadixString(16).padLeft(2,'0')}';
 
+    final syncId = _checkpointSyncId ?? const Uuid().v4();
+    _checkpointSyncId = null;
     final entry = Entry(
-      syncId:       const Uuid().v4(),
+      syncId:       syncId,
       date:         _startTime!.toIso8601String().substring(0, 10),
       startTime:    _startTime!.toIso8601String().substring(11, 19),
       endTime:      endTime.toIso8601String().substring(11, 19),
